@@ -151,3 +151,7 @@ uv run volume-mm-robot demo
 - [QuestDB: Market Making Algorithms](https://questdb.com/glossary/market-making-algorithms/): двусторонние котировки, inventory risk, adverse selection и quote throttling.
 
 Исходный код опубликован в публичном репозитории [volume-mm-robot](https://github.com/pashok8787-prog/volume-mm-robot).
+
+## Contributors
+
+Список участников проекта: [CONTRIBUTORS.md](CONTRIBUTORS.md).
