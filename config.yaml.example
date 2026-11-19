@@ -1,0 +1,39 @@
+exchange: aster
+symbol: ASTERUSDT
+mode: paper
+allow_live: false
+data_dir: data
+
+strategy:
+  bucket_ms: 1000
+  baseline_buckets: 60
+  signal_buckets: 10
+  min_baseline_buckets: 30
+  volume_multiplier: 4.0
+  min_signal_quote: 5000
+  min_trades: 12
+  min_side_ratio: 0.20
+  max_range_bps: 120
+  max_trend_bps: 45
+  max_spread_bps: 250
+  entry_offset_bps: 8
+  exit_offset_bps: 12
+  min_net_edge_bps: 3
+  participation_rate: 0.02
+  max_book_participation: 0.10
+  max_order_quote: 25
+  max_inventory_quote: 75
+  quote_refresh_ms: 2500
+  max_book_age_ms: 4000
+  stop_loss_bps: 100
+  stop_slippage_bps: 25
+  max_hold_sec: 180
+  cooldown_sec: 20
+  maker_fee_bps: 1.0
+  taker_fee_bps: 4.0
+  paper_queue_ratio: 1.0
+
+risk:
+  max_daily_loss_quote: 20
+  max_round_trips: 30
+  reconcile_ms: 1500
