@@ -150,4 +150,4 @@ uv run volume-mm-robot demo
 - [Официальный Hyperliquid Python SDK](https://github.com/hyperliquid-dex/hyperliquid-python-sdk).
 - [QuestDB: Market Making Algorithms](https://questdb.com/glossary/market-making-algorithms/): двусторонние котировки, inventory risk, adverse selection и quote throttling.
 
-Исходный код опубликован в приватном репозитории [volume-mm-robot](https://github.com/pashok8787-prog/volume-mm-robot).
+Исходный код опубликован в публичном репозитории [volume-mm-robot](https://github.com/pashok8787-prog/volume-mm-robot).
