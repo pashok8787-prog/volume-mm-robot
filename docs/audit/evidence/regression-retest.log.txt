@@ -1,0 +1,30 @@
+test_cli_live_override_requires_yaml_permission (test_regressions.CLITest.test_cli_live_override_requires_yaml_permission) ... ok
+test_live_entry_point_checks_both_permissions_before_network (test_regressions.CLITest.test_live_entry_point_checks_both_permissions_before_network) ... ok
+test_raw_recording_replays_config_and_watchdog_ticks (test_regressions.CLITest.test_raw_recording_replays_config_and_watchdog_ticks) ... ok
+test_watchdog_failure_ends_run_and_writes_summary (test_regressions.CLITest.test_watchdog_failure_ends_run_and_writes_summary) ... ok
+test_confirmed_rejection_does_not_leave_pending_order (test_regressions.LiveOrdersTest.test_confirmed_rejection_does_not_leave_pending_order) ... Размещение entry_buy: maker would cross
+ok
+test_failed_cancel_does_not_replace_order (test_regressions.LiveOrdersTest.test_failed_cancel_does_not_replace_order) ... Отмена 1: cancel failed
+ok
+test_fill_during_cancel_prevents_entry_replacement (test_regressions.LiveOrdersTest.test_fill_during_cancel_prevents_entry_replacement) ... ok
+test_lost_ack_blocks_new_entries_until_client_id_is_resolved (test_regressions.LiveOrdersTest.test_lost_ack_blocks_new_entries_until_client_id_is_resolved) ... Размещение entry_buy: response lost
+ok
+test_open_snapshot_after_cancel_remains_tracked (test_regressions.LiveOrdersTest.test_open_snapshot_after_cancel_remains_tracked) ... ok
+test_protective_stop_continues_after_partial_ioc (test_regressions.LiveOrdersTest.test_protective_stop_continues_after_partial_ioc) ... ok
+test_small_reduce_only_stop_uses_aster_exception (test_regressions.LiveOrdersTest.test_small_reduce_only_stop_uses_aster_exception) ... ok
+test_stale_book_still_reconciles_and_preserves_working_exit (test_regressions.LiveOrdersTest.test_stale_book_still_reconciles_and_preserves_working_exit) ... ok
+test_unconfirmed_fill_price_blocks_reconciliation (test_regressions.LiveOrdersTest.test_unconfirmed_fill_price_blocks_reconciliation) ... ok
+test_late_trade_cannot_fill_a_newer_order (test_regressions.PaperExecutionTest.test_late_trade_cannot_fill_a_newer_order) ... ok
+test_reduce_only_ioc_cannot_reverse_position (test_regressions.PaperExecutionTest.test_reduce_only_ioc_cannot_reverse_position) ... ok
+test_repeat_ioc_waits_for_new_book_depth (test_regressions.PaperExecutionTest.test_repeat_ioc_waits_for_new_book_depth) ... ok
+test_grids_respect_step_and_offset (test_regressions.StrategyTest.test_grids_respect_step_and_offset) ... ok
+test_partial_baseline_is_normalized_by_observed_seconds (test_regressions.StrategyTest.test_partial_baseline_is_normalized_by_observed_seconds) ... ok
+test_partial_close_keeps_exact_size_and_counts_round_trip (test_regressions.StrategyTest.test_partial_close_keeps_exact_size_and_counts_round_trip) ... ok
+test_aster_distinguishes_timeout_from_confirmed_rejection (test_regressions.VenueContractTest.test_aster_distinguishes_timeout_from_confirmed_rejection) ... ok
+test_aster_resolves_using_same_client_id_as_placement (test_regressions.VenueContractTest.test_aster_resolves_using_same_client_id_as_placement) ... ok
+test_hyperliquid_unknown_order_is_uncertain (test_regressions.VenueContractTest.test_hyperliquid_unknown_order_is_uncertain) ... ok
+
+----------------------------------------------------------------------
+Ran 22 tests in 0.434s
+
+OK

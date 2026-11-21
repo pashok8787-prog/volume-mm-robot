@@ -1,0 +1,8 @@
+20261121-130426-aster-ASTERUSDT-paper.raw.jsonl
+  events=954, book=857, trade=97
+  first_to_last_event_ts_ms=118917, first_to_last_book_ts_ms=118917, max_book_gap_ms=494
+  backward_book_ts_count=0, backward_adjacent_event_ts_count=87
+20261121-130427-hyperliquid-HYPE-paper.raw.jsonl
+  events=546, book=10, trade=536
+  first_to_last_event_ts_ms=128219, first_to_last_book_ts_ms=108651, max_book_gap_ms=12532
+  backward_book_ts_count=0, backward_adjacent_event_ts_count=1

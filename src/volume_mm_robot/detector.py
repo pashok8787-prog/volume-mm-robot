@@ -39,9 +39,18 @@ class VolumeDetector:
     def __init__(self, config: StrategyConfig) -> None:
         self.config = config
         self._buckets: dict[int, Bucket] = {}
+        self._first_bucket: int | None = None
+
+    def reset(self) -> None:
+        self._buckets.clear()
+        self._first_bucket = None
 
     def add(self, trade: Trade) -> None:
         bucket_id = trade.timestamp_ms // self.config.bucket_ms
+        if self._first_bucket is None:
+            self._first_bucket = bucket_id
+        if bucket_id < self._first_bucket:
+            return
         self._buckets.setdefault(bucket_id, Bucket()).add(trade)
         oldest = bucket_id - self.config.baseline_buckets - self.config.signal_buckets - 5
         for key in [key for key in self._buckets if key < oldest]:
@@ -56,15 +65,15 @@ class VolumeDetector:
         )
         recent = [self._buckets.get(key, Bucket()) for key in recent_ids]
         baseline = [self._buckets.get(key, Bucket()) for key in baseline_ids]
-        first_bucket = min(self._buckets, default=last)
-        available_baseline = max(0, last - self.config.signal_buckets - first_bucket + 1)
+        first_bucket = self._first_bucket if self._first_bucket is not None else last
+        available_baseline = min(self.config.baseline_buckets, max(0, baseline_ids.stop - first_bucket))
         turnover = sum(bucket.turnover for bucket in recent)
         buy = sum(bucket.buy_quote for bucket in recent)
         sell = sum(bucket.sell_quote for bucket in recent)
         trades = sum(bucket.trades for bucket in recent)
         baseline_turnover = (
             sum(bucket.turnover for bucket in baseline)
-            / self.config.baseline_buckets
+            / max(1, available_baseline)
             * self.config.signal_buckets
         )
         matched = 2 * min(buy, sell)

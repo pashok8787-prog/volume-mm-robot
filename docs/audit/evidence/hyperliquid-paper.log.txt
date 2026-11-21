@@ -1,0 +1,27 @@
+hyperliquid HYPE paper: tick=0.0, step=0.01, min=10.0. Ctrl+C для остановки.
+{
+  "exchange": "hyperliquid",
+  "symbol": "HYPE",
+  "mode": "paper",
+  "signals": 0,
+  "orders_placed": 0,
+  "orders_canceled": 0,
+  "fills": 0,
+  "rejected": 0,
+  "round_trips": 0,
+  "position_quantity": 0.0,
+  "position_notional_quote": 0.0,
+  "realized_pnl_quote": 0.0,
+  "unrealized_pnl_quote": 0.0,
+  "net_pnl_quote": 0.0,
+  "fees_quote": 0.0,
+  "halted": false,
+  "last_reason": "stale_book",
+  "reason_counts": {
+    "warmup": 69,
+    "stale_book": 380,
+    "low_volume": 162
+  }
+}
+События: data\20261121-130427-hyperliquid-HYPE-paper.events.jsonl
+Исходные данные: data\20261121-130427-hyperliquid-HYPE-paper.raw.jsonl

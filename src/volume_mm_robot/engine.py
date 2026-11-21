@@ -3,12 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import time
 import uuid
 from collections.abc import Callable
 from typing import Any
 
-from volume_mm_robot.brokers import Broker, FillCallback, OrderCallback, PaperBroker
+from volume_mm_robot.brokers import Broker, FillCallback, OrderCallback, OrderRejected, PaperBroker
 from volume_mm_robot.config import AppConfig
 from volume_mm_robot.detector import VolumeDetector
 from volume_mm_robot.journal import Journal
@@ -28,7 +27,7 @@ from volume_mm_robot.models import (
 )
 
 logger = logging.getLogger(__name__)
-BrokerFactory = Callable[[FillCallback, OrderCallback], Broker]
+BrokerFactory = Callable[[FillCallback, OrderCallback, Position], Broker]
 
 
 class MarketMakingRobot:
@@ -47,54 +46,67 @@ class MarketMakingRobot:
         self.position = initial_position or Position()
         self.stats = RuntimeStats()
         self.book: OrderBook | None = None
-        self.broker = broker_factory(self._on_fill, self._on_order)
+        self.broker = broker_factory(self._on_fill, self._on_order, self.position)
         self.halted = False
         self.cooldown_until_ms = 0
-        self._last_timestamp = int(time.time() * 1000)
-        self._last_tick = 0
-        self._last_reconcile = 0
+        self._last_timestamp = 0
+        self._last_tick = -100
+        self._last_reconcile: int | None = None
+        self._last_stop_attempt: int | None = None
+        self._stopping_position = False
+        self._reconciled = True
         self._last_signal: FlowSignal | None = None
         self._seen_round_trips = self.position.round_trips
         self._lock = asyncio.Lock()
 
-    async def handle(self, event: Trade | OrderBook) -> None:
+    async def handle(self, event: Trade | OrderBook, received_at_ms: int | None = None) -> None:
         async with self._lock:
-            self._last_timestamp = event.timestamp_ms
-            self.journal.raw(event)
+            if event.symbol != self.config.symbol:
+                raise ValueError(f"Получен инструмент {event.symbol}, ожидался {self.config.symbol}")
+            timestamp_ms = event.timestamp_ms if received_at_ms is None else received_at_ms
+            self._last_timestamp = max(self._last_timestamp, timestamp_ms)
+            self.journal.raw(event, received_at_ms=received_at_ms)
             if isinstance(event, Trade):
-                self.detector.add(event)
+                if self._book_is_fresh(self._last_timestamp):
+                    self.detector.add(event)
                 self.broker.on_trade(event)
-            else:
+            elif self.book is None or event.timestamp_ms >= self.book.timestamp_ms:
                 self.book = event
-            if event.timestamp_ms - self._last_tick >= 100:
-                await self._tick(event.timestamp_ms)
+            if self._last_timestamp - self._last_tick >= 100:
+                await self._tick(self._last_timestamp)
 
     async def tick(self, timestamp_ms: int) -> None:
         async with self._lock:
-            self._last_timestamp = timestamp_ms
-            await self._tick(timestamp_ms)
+            self._last_timestamp = max(self._last_timestamp, timestamp_ms)
+            self.journal.tick(timestamp_ms)
+            await self._tick(self._last_timestamp)
+
+    def _book_is_fresh(self, timestamp_ms: int) -> bool:
+        book = self.book
+        return (
+            book is not None
+            and 0 < book.best_bid < book.best_ask
+            and abs(timestamp_ms - book.timestamp_ms) <= self.config.strategy.max_book_age_ms
+        )
 
     async def _tick(self, timestamp_ms: int) -> None:
         self._last_tick = timestamp_ms
-        if self.book is None:
-            return
-        book = self.book
-        if timestamp_ms - book.timestamp_ms > self.config.strategy.max_book_age_ms:
-            self.stats.reason("stale_book")
-            await self._cancel_purposes(tuple(OrderPurpose))
-            return
-        if timestamp_ms - self._last_reconcile >= self.config.risk.reconcile_ms:
+        if (
+            self._last_reconcile is None
+            or timestamp_ms - self._last_reconcile >= self.config.risk.reconcile_ms
+        ):
             self._last_reconcile = timestamp_ms
             try:
                 await self.broker.sync()
+                self._reconciled = True
             except (RuntimeError, TimeoutError) as error:
+                self._reconciled = False
                 logger.warning("Сверка ордеров: %s", error)
                 self.journal.event("error", kind="reconcile", message=str(error))
-                return
 
-        signal = self.detector.evaluate(timestamp_ms)
-        self._record_signal(signal)
-        midpoint = book.midpoint
+        book = self.book
+        fresh_book = book is not None and self._book_is_fresh(timestamp_ms)
+        midpoint = book.midpoint if book is not None and fresh_book else 0.0
         equity_pnl = self.position.realized_pnl + self.position.unrealized_pnl(midpoint)
         if equity_pnl <= -self.config.risk.max_daily_loss_quote:
             self.halted = True
@@ -103,14 +115,31 @@ class MarketMakingRobot:
             self.halted = True
             self.stats.reason("round_trip_limit")
 
-        if self.position.quantity != 0:
+        if book is None or not fresh_book:
+            if book is not None:
+                self.stats.reason("stale_book")
+            self.detector.reset()
+            self._last_signal = None
             await self._cancel_all_entries()
-            await self._manage_position(timestamp_ms, book)
             return
 
-        await self._cancel_purposes((OrderPurpose.EXIT, OrderPurpose.STOP))
+        signal = self.detector.evaluate(timestamp_ms)
+        self._record_signal(signal)
+        if self.position.quantity != 0:
+            await self._cancel_all_entries()
+            if self.position.quantity != 0:
+                await self._manage_position(timestamp_ms, book)
+            return
+
+        exits_closed = await self._cancel_purposes((OrderPurpose.EXIT, OrderPurpose.STOP))
         can_quote = (
-            signal.active and not self.halted and timestamp_ms >= self.cooldown_until_ms and midpoint > 0
+            exits_closed
+            and self._reconciled
+            and not self.broker.has_pending
+            and self.position.quantity == 0
+            and signal.active
+            and not self.halted
+            and timestamp_ms >= self.cooldown_until_ms
         )
         if not can_quote:
             await self._cancel_all_entries()
@@ -139,7 +168,10 @@ class MarketMakingRobot:
         buy_quote = self._entry_quote(Side.BUY, base_quote, bid, book, midpoint)
         sell_quote = self._entry_quote(Side.SELL, base_quote, ask, book, midpoint)
         await self._ensure_quote(OrderPurpose.ENTRY_BUY, Side.BUY, bid, buy_quote, timestamp_ms)
-        await self._ensure_quote(OrderPurpose.ENTRY_SELL, Side.SELL, ask, sell_quote, timestamp_ms)
+        if self.position.quantity == 0 and not self.broker.has_pending:
+            await self._ensure_quote(OrderPurpose.ENTRY_SELL, Side.SELL, ask, sell_quote, timestamp_ms)
+        if self.position.quantity != 0 or self.broker.has_pending:
+            await self._cancel_all_entries()
 
     def _entry_quote(
         self, side: Side, base_quote: float, price: float, book: OrderBook, midpoint: float
@@ -158,20 +190,19 @@ class MarketMakingRobot:
         midpoint = book.midpoint
         long = self.position.quantity > 0
         side = Side.SELL if long else Side.BUY
-        adverse_bps = (
-            (self.position.average_price - midpoint) / self.position.average_price * 10_000
-            if long
-            else (midpoint - self.position.average_price) / self.position.average_price * 10_000
-        )
-        held_ms = timestamp_ms - (self.position.opened_at_ms or timestamp_ms)
-        stop = self.halted or adverse_bps >= config.stop_loss_bps or held_ms >= config.max_hold_sec * 1000
-        quantity = self.rules.quantity(abs(self.position.quantity))
-        if quantity <= 0:
-            await self._cancel_purposes((OrderPurpose.EXIT, OrderPurpose.STOP))
-            return
-        if stop:
+        average_price = self.position.average_price
+        adverse_bps = math.inf
+        if math.isfinite(average_price) and average_price > 0:
+            adverse_bps = (midpoint / average_price - 1) * side.sign * 10_000
+        opened_at = self.position.opened_at_ms
+        held_ms = timestamp_ms - opened_at if opened_at is not None else 0
+        if self.halted or adverse_bps >= config.stop_loss_bps or held_ms >= config.max_hold_sec * 1000:
+            self._stopping_position = True
+        quantity = abs(self.position.quantity)
+        if self._stopping_position:
             self.stats.reason("protective_exit")
-            await self._cancel_purposes((OrderPurpose.EXIT,))
+            if not await self._cancel_exit_before_replace(OrderPurpose.EXIT):
+                return
             price = (
                 book.best_bid * (1 - config.stop_slippage_bps / 10_000)
                 if long
@@ -182,13 +213,15 @@ class MarketMakingRobot:
                 OrderPurpose.STOP,
                 side,
                 price,
-                quantity * price,
+                0.0,
                 timestamp_ms,
                 post_only=False,
                 reduce_only=True,
+                reduce_quantity=quantity,
             )
             return
-        await self._cancel_purposes((OrderPurpose.STOP,))
+        if not await self._cancel_exit_before_replace(OrderPurpose.STOP):
+            return
         target = self.position.average_price * (
             1 + config.exit_offset_bps / 10_000 if long else 1 - config.exit_offset_bps / 10_000
         )
@@ -197,11 +230,16 @@ class MarketMakingRobot:
             OrderPurpose.EXIT,
             side,
             price,
-            quantity * price,
+            0.0,
             timestamp_ms,
             post_only=True,
             reduce_only=True,
+            reduce_quantity=quantity,
         )
+
+    async def _cancel_exit_before_replace(self, purpose: OrderPurpose) -> bool:
+        quantity = self.position.quantity
+        return await self._cancel_purposes((purpose,)) and self.position.quantity == quantity
 
     async def _ensure_quote(
         self,
@@ -212,26 +250,43 @@ class MarketMakingRobot:
         timestamp_ms: int,
         post_only: bool = True,
         reduce_only: bool = False,
+        reduce_quantity: float | None = None,
     ) -> None:
         existing = self._open_order(purpose)
-        if quote < self.rules.min_notional or price <= 0:
+        if not math.isfinite(price) or price <= 0 or price < self.rules.min_price:
             if existing is not None:
                 await self._cancel(existing)
             return
-        quantity = self.rules.quantity(quote / price)
-        if quantity <= 0 or quantity * price < self.rules.min_notional:
+        quantity = self.rules.quantity(reduce_quantity if reduce_quantity is not None else quote / price)
+        min_notional = (
+            0.0 if reduce_only and self.rules.reduce_only_below_min_notional else self.rules.min_notional
+        )
+        if quantity <= 0 or quantity * price < min_notional:
             if existing is not None:
                 await self._cancel(existing)
+            if reduce_only:
+                self.stats.reason("position_below_order_minimum")
             return
         if existing is not None:
             age = timestamp_ms - existing.created_at_ms
             same_price = abs(existing.request.price - price) < max(self.rules.tick_size, 1e-12) / 2
-            same_size = abs(existing.remaining_quantity - quantity) <= self.rules.step_size
+            same_size = abs(existing.remaining_quantity - quantity) < self.rules.step_size / 2
             if same_price and same_size:
                 return
             if age < self.config.strategy.quote_refresh_ms:
                 return
-            await self._cancel(existing)
+            quantity_before_cancel = self.position.quantity
+            if not await self._cancel(existing) or self.position.quantity != quantity_before_cancel:
+                return
+        if self.broker.has_pending or self.book is None:
+            return
+        if purpose is OrderPurpose.STOP:
+            if (
+                self._last_stop_attempt is not None
+                and timestamp_ms - self._last_stop_attempt < self.config.risk.reconcile_ms
+            ):
+                return
+            self._last_stop_attempt = timestamp_ms
         request = OrderRequest(
             symbol=self.config.symbol,
             client_id=uuid.uuid4().hex,
@@ -242,30 +297,34 @@ class MarketMakingRobot:
             post_only=post_only,
             reduce_only=reduce_only,
         )
-        if self.book is None:
-            return
         try:
             await self.broker.place(request, timestamp_ms, self.book)
         except (RuntimeError, TimeoutError) as error:
-            self.stats.rejected += 1
-            self.journal.event("error", kind="place", message=str(error), purpose=purpose.value)
+            if isinstance(error, OrderRejected):
+                self.stats.rejected += 1
+            self.journal.event(
+                "error", kind="place", message=str(error), purpose=purpose.value, client_id=request.client_id
+            )
             logger.warning("Размещение %s: %s", purpose.value, error)
 
     async def _cancel_all_entries(self) -> None:
         await self._cancel_purposes((OrderPurpose.ENTRY_BUY, OrderPurpose.ENTRY_SELL))
 
-    async def _cancel_purposes(self, purposes: tuple[OrderPurpose, ...]) -> None:
+    async def _cancel_purposes(self, purposes: tuple[OrderPurpose, ...]) -> bool:
+        closed = True
         for order in list(self.broker.orders.values()):
             if order.status is OrderStatus.OPEN and order.request.purpose in purposes:
-                await self._cancel(order)
+                closed = await self._cancel(order) and closed
+        return closed
 
-    async def _cancel(self, order: Order) -> None:
+    async def _cancel(self, order: Order) -> bool:
         try:
             await self.broker.cancel(order)
-            self.stats.orders_canceled += 1
         except (RuntimeError, TimeoutError) as error:
             self.journal.event("error", kind="cancel", message=str(error), order_id=order.order_id)
             logger.warning("Отмена %s: %s", order.order_id, error)
+            return False
+        return order.status is not OrderStatus.OPEN
 
     def _open_order(self, purpose: OrderPurpose) -> Order | None:
         return next(
@@ -307,6 +366,9 @@ class MarketMakingRobot:
             timestamp,
         )
         self.stats.fills += 1
+        if self.position.quantity == 0:
+            self._stopping_position = False
+            self._last_stop_attempt = None
         if self.position.round_trips > self._seen_round_trips:
             self._seen_round_trips = self.position.round_trips
             self.cooldown_until_ms = timestamp + self.config.strategy.cooldown_sec * 1000
@@ -323,14 +385,26 @@ class MarketMakingRobot:
             self.stats.orders_placed += 1
         elif action == "rejected":
             self.stats.rejected += 1
+        elif action == "canceled":
+            self.stats.orders_canceled += 1
         self.journal.event("order", action=action, order=order)
 
     async def shutdown(self) -> None:
         async with self._lock:
+            if self.broker.has_pending:
+                try:
+                    await self.broker.sync()
+                except (RuntimeError, TimeoutError) as error:
+                    logger.warning("Сверка перед остановкой: %s", error)
             for order in list(self.broker.orders.values()):
                 if order.status is OrderStatus.OPEN:
                     await self._cancel(order)
-            if isinstance(self.broker, PaperBroker) and self.position.quantity != 0 and self.book is not None:
+            if (
+                isinstance(self.broker, PaperBroker)
+                and self.position.quantity != 0
+                and self.book is not None
+                and self._book_is_fresh(self._last_timestamp)
+            ):
                 side = Side.SELL if self.position.quantity > 0 else Side.BUY
                 price = self.book.best_bid if side is Side.SELL else self.book.best_ask
                 request = OrderRequest(
@@ -359,6 +433,8 @@ class MarketMakingRobot:
             "fills": self.stats.fills,
             "rejected": self.stats.rejected,
             "round_trips": self.position.round_trips,
+            "open_orders": len(self.broker.orders),
+            "pending_order_confirmation": self.broker.has_pending,
             "position_quantity": self.position.quantity,
             "position_notional_quote": self.position.notional,
             "realized_pnl_quote": self.position.realized_pnl,

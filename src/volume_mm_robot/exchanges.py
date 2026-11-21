@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
+from decimal import Decimal
 from typing import Any
 from urllib.parse import urlencode
 
 import aiohttp
 
+from volume_mm_robot.brokers import OrderRejected
 from volume_mm_robot.models import (
     MarketRules,
     OrderBook,
@@ -32,17 +35,30 @@ def _status(value: str) -> OrderStatus:
         return OrderStatus.FILLED
     if normalized in {"new", "open", "partially_filled", "partiallyfilled"}:
         return OrderStatus.OPEN
-    if normalized in {"rejected", "expired"}:
+    if normalized.endswith("rejected"):
         return OrderStatus.REJECTED
-    return OrderStatus.CANCELED
+    if normalized.endswith("canceled") or normalized in {"expired", "expired_in_match"}:
+        return OrderStatus.CANCELED
+    raise RuntimeError(f"Неизвестный статус ордера: {value}")
+
+
+class VenueAPIError(RuntimeError):
+    def __init__(self, status: int, code: int | None, message: str) -> None:
+        super().__init__(f"HTTP {status}, code={code}: {message}")
+        self.status = status
+        self.code = code
 
 
 async def _response_json(response: aiohttp.ClientResponse) -> Any:
-    data: Any = await response.json(content_type=None)
-    if response.status >= 400:
-        raise RuntimeError(f"HTTP {response.status}: {data}")
-    if isinstance(data, dict) and isinstance(data.get("code"), int) and data["code"] < 0:
-        raise RuntimeError(f"API: {data}")
+    try:
+        data: Any = await response.json(content_type=None)
+    except (ValueError, aiohttp.ClientError) as error:
+        raise VenueAPIError(response.status, None, "ответ не удалось прочитать как JSON") from error
+    code = data.get("code") if isinstance(data, dict) else None
+    code = code if isinstance(code, int) else None
+    if response.status >= 400 or (code is not None and code < 0):
+        message = str(data.get("msg", "ошибка API")) if isinstance(data, dict) else "ошибка API"
+        raise VenueAPIError(response.status, code, message)
     return data
 
 
@@ -64,11 +80,16 @@ class AsterVenue:
         if item is None:
             raise ValueError(f"Инструмент {symbol} не найден на Aster")
         filters = {entry["filterType"]: entry for entry in item["filters"]}
+        prices = filters["PRICE_FILTER"]
+        lots = filters["LOT_SIZE"]
         min_notional = filters.get("MIN_NOTIONAL", {})
         return MarketRules(
-            tick_size=float(filters["PRICE_FILTER"]["tickSize"]),
-            step_size=float(filters["LOT_SIZE"]["stepSize"]),
+            tick_size=float(prices["tickSize"]),
+            step_size=float(lots["stepSize"]),
             min_notional=float(min_notional.get("notional", min_notional.get("minNotional", 5))),
+            min_price=float(prices.get("minPrice", 0)),
+            min_quantity=float(lots.get("minQty", 0)),
+            reduce_only_below_min_notional=True,
         )
 
     async def events(self, symbol: str) -> AsyncIterator[MarketEvent]:
@@ -100,6 +121,7 @@ class AsterVenue:
                                 )
                         elif message.type is aiohttp.WSMsgType.ERROR:
                             raise ConnectionError(str(websocket.exception()))
+                    raise ConnectionError("поток завершён")
             except asyncio.CancelledError:
                 raise
             except (aiohttp.ClientError, ConnectionError, TimeoutError) as error:
@@ -107,6 +129,9 @@ class AsterVenue:
                 await asyncio.sleep(2)
 
     async def prepare_trading(self, symbol: str) -> Position:
+        mode = await self._signed_request("GET", "/fapi/v3/positionSide/dual", {})
+        if mode.get("dualSidePosition") is not False:
+            raise RuntimeError("Для торговли на Aster требуется подтверждённый one-way режим")
         open_orders = await self._signed_request("GET", "/fapi/v3/openOrders", {"symbol": symbol})
         if open_orders:
             raise RuntimeError("На Aster уже есть открытые ордера по инструменту; запуск остановлен")
@@ -126,28 +151,54 @@ class AsterVenue:
             "side": request.side.value.upper(),
             "type": "LIMIT",
             "timeInForce": "GTX" if request.post_only else "IOC",
-            "quantity": str(request.quantity),
-            "price": str(request.price),
-            "newClientOrderId": f"vmm{request.client_id[:29]}",
+            "quantity": format(Decimal(str(request.quantity)), "f"),
+            "price": format(Decimal(str(request.price)), "f"),
+            "newClientOrderId": self._client_order_id(request.client_id),
             "newOrderRespType": "RESULT",
         }
         if request.reduce_only:
             params["reduceOnly"] = "true"
-        data = await self._signed_request("POST", "/fapi/v3/order", params)
-        return VenueOrderState(
-            order_id=str(data["orderId"]),
-            status=_status(str(data["status"])),
-            filled_quantity=float(data.get("executedQty", 0)),
-            average_fill_price=float(data.get("avgPrice", 0)),
-        )
+        try:
+            data = await self._signed_request("POST", "/fapi/v3/order", params)
+        except VenueAPIError as error:
+            if (
+                error.status < 500
+                and error.status not in {408, 429}
+                and error.code is not None
+                and error.code not in {-1000, -1001, -1006, -1007}
+            ):
+                raise OrderRejected(str(error)) from error
+            raise
+        return self._order_state(data)
 
     async def cancel_order(self, symbol: str, order_id: str) -> None:
         await self._signed_request("DELETE", "/fapi/v3/order", {"symbol": symbol, "orderId": order_id})
 
     async def fetch_order(self, symbol: str, order_id: str) -> VenueOrderState:
         data = await self._signed_request("GET", "/fapi/v3/order", {"symbol": symbol, "orderId": order_id})
+        return self._order_state(data)
+
+    async def fetch_order_by_client_id(self, symbol: str, client_id: str) -> VenueOrderState | None:
+        try:
+            data = await self._signed_request(
+                "GET",
+                "/fapi/v3/order",
+                {"symbol": symbol, "origClientOrderId": self._client_order_id(client_id)},
+            )
+        except VenueAPIError as error:
+            if error.code == -2013:
+                return None
+            raise
+        return self._order_state(data)
+
+    @staticmethod
+    def _client_order_id(client_id: str) -> str:
+        return f"vmm{client_id[:29]}"
+
+    @staticmethod
+    def _order_state(data: Any) -> VenueOrderState:
         return VenueOrderState(
-            order_id=order_id,
+            order_id=str(data["orderId"]),
             status=_status(str(data["status"])),
             filled_quantity=float(data.get("executedQty", 0)),
             average_fill_price=float(data.get("avgPrice", 0)),
@@ -190,8 +241,11 @@ class AsterVenue:
             encode_typed_data(full_message=typed_data), private_key=private_key
         ).signature.hex()
         url = f"{self.trading_url}{path}?{encoded}&signature={signature}"
-        async with self.session.request(method, url) as response:
-            return await _response_json(response)
+        try:
+            async with self.session.request(method, url, timeout=aiohttp.ClientTimeout(total=4)) as response:
+                return await _response_json(response)
+        except aiohttp.ClientError as error:
+            raise RuntimeError(f"Ошибка соединения Aster при {method} {path}") from error
 
 
 class HyperliquidVenue:
@@ -255,6 +309,7 @@ class HyperliquidVenue:
                                 )
                         elif message.type is aiohttp.WSMsgType.ERROR:
                             raise ConnectionError(str(websocket.exception()))
+                    raise ConnectionError("поток завершён")
             except asyncio.CancelledError:
                 raise
             except (aiohttp.ClientError, ConnectionError, TimeoutError) as error:
@@ -262,11 +317,11 @@ class HyperliquidVenue:
                 await asyncio.sleep(2)
 
     async def prepare_trading(self, symbol: str) -> Position:
-        self._sdk()
-        orders = await asyncio.to_thread(self._exchange.info.frontend_open_orders, self._account_address)
+        exchange = await self._call_sdk(self._sdk)
+        orders = await self._call_sdk(exchange.info.frontend_open_orders, self._account_address)
         if any(item["coin"] == symbol for item in orders):
             raise RuntimeError("На Hyperliquid уже есть открытые ордера по инструменту; запуск остановлен")
-        state = await asyncio.to_thread(self._exchange.info.user_state, self._account_address)
+        state = await self._call_sdk(exchange.info.user_state, self._account_address)
         for entry in state["assetPositions"]:
             item = entry["position"]
             if item["coin"] == symbol:
@@ -282,7 +337,7 @@ class HyperliquidVenue:
         from hyperliquid.utils.types import Cloid
 
         exchange = self._sdk()
-        result = await asyncio.to_thread(
+        result = await self._call_sdk(
             exchange.order,
             request.symbol,
             request.side is Side.BUY,
@@ -296,43 +351,72 @@ class HyperliquidVenue:
             raise RuntimeError(f"Hyperliquid order: {result}")
         status = result["response"]["data"]["statuses"][0]
         if "error" in status:
-            raise RuntimeError(f"Hyperliquid order: {status['error']}")
+            raise OrderRejected(f"Hyperliquid order: {status['error']}")
         if "resting" in status:
             return VenueOrderState(str(status["resting"]["oid"]), OrderStatus.OPEN, 0.0, 0.0)
         if "filled" in status:
             filled = status["filled"]
+            quantity = float(filled["totalSz"])
             return VenueOrderState(
                 str(filled["oid"]),
-                OrderStatus.FILLED,
-                float(filled["totalSz"]),
+                OrderStatus.FILLED if quantity >= request.quantity else OrderStatus.CANCELED,
+                quantity,
                 float(filled["avgPx"]),
             )
         raise RuntimeError(f"Hyperliquid order status: {status}")
 
     async def cancel_order(self, symbol: str, order_id: str) -> None:
-        result = await asyncio.to_thread(self._sdk().cancel, symbol, int(order_id))
-        if result.get("status") != "ok":
+        result = await self._call_sdk(self._sdk().cancel, symbol, int(order_id))
+        if result.get("status") != "ok" or result["response"]["data"]["statuses"] != ["success"]:
             raise RuntimeError(f"Hyperliquid cancel: {result}")
 
     async def fetch_order(self, symbol: str, order_id: str) -> VenueOrderState:
         exchange = self._sdk()
-        result = await asyncio.to_thread(
-            exchange.info.query_order_by_oid, self._account_address, int(order_id)
+        result = await self._call_sdk(exchange.info.query_order_by_oid, self._account_address, int(order_id))
+        state = await self._order_state(result)
+        if state is None:
+            raise RuntimeError(f"Hyperliquid не подтвердил статус ордера {order_id}")
+        return state
+
+    async def fetch_order_by_client_id(self, symbol: str, client_id: str) -> VenueOrderState | None:
+        from hyperliquid.utils.types import Cloid
+
+        result = await self._call_sdk(
+            self._sdk().info.query_order_by_cloid, self._account_address, Cloid.from_str(f"0x{client_id}")
         )
+        return await self._order_state(result)
+
+    async def _order_state(self, result: Any) -> VenueOrderState | None:
+        if result.get("status") == "unknownOid":
+            return None
         if result.get("status") != "order":
-            return VenueOrderState(order_id, OrderStatus.CANCELED, 0.0, 0.0)
+            raise RuntimeError(f"Hyperliquid order status: {result}")
         wrapper = result["order"]
         basic = wrapper["order"]
-        filled = max(0.0, float(basic["origSz"]) - float(basic["sz"]))
-        fills = await asyncio.to_thread(exchange.info.user_fills, self._account_address)
+        order_id = str(basic["oid"])
+        status = _status(str(wrapper["status"]))
+        filled = float(Decimal(basic["origSz"]) - Decimal(basic["sz"]))
+        if filled <= 0:
+            if status is OrderStatus.FILLED:
+                raise RuntimeError(f"Hyperliquid не подтвердил объём ордера {order_id}")
+            return VenueOrderState(order_id, status, 0.0, 0.0)
+        fills = await self._call_sdk(self._sdk().info.user_fills, self._account_address)
         matching = [item for item in fills if str(item["oid"]) == order_id]
         quantity = sum(float(item["sz"]) for item in matching)
-        average = (
-            sum(float(item["px"]) * float(item["sz"]) for item in matching) / quantity
-            if quantity > 0
-            else 0.0
-        )
-        return VenueOrderState(order_id, _status(str(wrapper["status"])), filled, average)
+        if not math.isclose(quantity, filled, abs_tol=1e-12, rel_tol=0):
+            raise RuntimeError(f"Hyperliquid вернул несогласованные объёмы исполнений ордера {order_id}")
+        average = sum(float(item["px"]) * float(item["sz"]) for item in matching) / quantity
+        return VenueOrderState(order_id, status, filled, average)
+
+    @staticmethod
+    async def _call_sdk[**P, T](method: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+        from hyperliquid.utils.error import Error
+        from requests.exceptions import RequestException
+
+        try:
+            return await asyncio.to_thread(method, *args, **kwargs)
+        except (Error, RequestException) as error:
+            raise RuntimeError(f"Ошибка Hyperliquid SDK: {type(error).__name__}") from error
 
     def _sdk(self) -> Any:
         if self._exchange is not None:
@@ -349,5 +433,5 @@ class HyperliquidVenue:
         if not private_key or not self._account_address:
             raise RuntimeError("Нужны HYPERLIQUID_PRIVATE_KEY и HYPERLIQUID_ACCOUNT_ADDRESS")
         wallet = Account.from_key(private_key)
-        self._exchange = Exchange(wallet, self.api_url, account_address=self._account_address)
+        self._exchange = Exchange(wallet, self.api_url, account_address=self._account_address, timeout=4.0)
         return self._exchange

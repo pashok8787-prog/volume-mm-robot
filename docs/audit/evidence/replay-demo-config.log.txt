@@ -1,0 +1,25 @@
+{
+  "exchange": "aster",
+  "symbol": "DEMO",
+  "mode": "paper",
+  "signals": 1,
+  "orders_placed": 7,
+  "orders_canceled": 5,
+  "fills": 2,
+  "rejected": 0,
+  "round_trips": 1,
+  "position_quantity": 0.0,
+  "position_notional_quote": 0.0,
+  "realized_pnl_quote": 0.027500749999998863,
+  "unrealized_pnl_quote": 0.0,
+  "net_pnl_quote": 0.027500749999998863,
+  "fees_quote": 0.00499925,
+  "halted": false,
+  "last_reason": "ok",
+  "reason_counts": {
+    "warmup": 45,
+    "low_volume": 55,
+    "ok": 21
+  }
+}
+События: data\20261121-130555-aster-DEMO-replay.events.jsonl

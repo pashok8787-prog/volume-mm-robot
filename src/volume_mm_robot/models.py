@@ -82,6 +82,18 @@ class MarketRules:
     min_notional: float
     max_price_decimals: int | None = None
     significant_figures: int | None = None
+    min_price: float = 0.0
+    min_quantity: float = 0.0
+    reduce_only_below_min_notional: bool = False
+
+    @staticmethod
+    def _round_step(value: Decimal, step: float, origin: float, rounding: str) -> float:
+        if step <= 0:
+            return float(value)
+        quantum = Decimal(str(step))
+        offset = Decimal(str(origin))
+        units = ((value - offset) / quantum).to_integral_value(rounding=rounding)
+        return float(offset + units * quantum)
 
     def price(self, value: float, side: Side) -> float:
         rounding = ROUND_FLOOR if side is Side.BUY else ROUND_CEILING
@@ -92,13 +104,13 @@ class MarketRules:
             if self.max_price_decimals is not None:
                 decimals = min(decimals, self.max_price_decimals)
             quantum = Decimal(1).scaleb(-max(0, decimals))
-        else:
-            quantum = Decimal(str(self.tick_size))
-        return float(decimal_value.quantize(quantum, rounding=rounding))
+            return float(decimal_value.quantize(quantum, rounding=rounding))
+        return self._round_step(decimal_value, self.tick_size, self.min_price, rounding)
 
     def quantity(self, value: float) -> float:
-        quantum = Decimal(str(self.step_size))
-        return float(Decimal(str(value)).quantize(quantum, rounding=ROUND_FLOOR))
+        if value < self.min_quantity:
+            return 0.0
+        return self._round_step(Decimal(str(value)), self.step_size, self.min_quantity, ROUND_FLOOR)
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,7 +152,7 @@ class Order:
 
     @property
     def remaining_quantity(self) -> float:
-        return max(0.0, self.request.quantity - self.filled_quantity)
+        return max(0.0, float(Decimal(str(self.request.quantity)) - Decimal(str(self.filled_quantity))))
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,7 +192,9 @@ class Position:
     def apply(self, fill: Fill, maker_fee_rate: float, taker_fee_rate: float, timestamp_ms: int) -> None:
         old_quantity = self.quantity
         delta = fill.quantity * fill.side.sign
-        new_quantity = old_quantity + delta
+        new_quantity = float(Decimal(str(old_quantity)) + Decimal(str(delta)))
+        if abs(new_quantity) < 1e-12:
+            new_quantity = 0.0
         fee_rate = maker_fee_rate if fill.maker else taker_fee_rate
         fee = fill.notional * fee_rate
         self.fees += fee
@@ -206,7 +220,7 @@ class Position:
                 self.average_price = fill.price
                 self.opened_at_ms = timestamp_ms
 
-        self.quantity = 0.0 if abs(new_quantity) < 1e-12 else new_quantity
+        self.quantity = new_quantity
 
     def unrealized_pnl(self, midpoint: float) -> float:
         if self.quantity == 0 or midpoint <= 0:

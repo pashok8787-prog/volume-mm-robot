@@ -4,8 +4,10 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import time
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import aiohttp
@@ -14,7 +16,7 @@ from volume_mm_robot.brokers import LiveBroker, PaperBroker
 from volume_mm_robot.config import AppConfig, load_config
 from volume_mm_robot.engine import MarketMakingRobot
 from volume_mm_robot.exchanges import AsterVenue, HyperliquidVenue
-from volume_mm_robot.journal import Journal, read_raw
+from volume_mm_robot.journal import Journal, read_raw, read_raw_metadata
 from volume_mm_robot.models import MarketRules, Position
 from volume_mm_robot.synthetic import demo_events
 
@@ -35,17 +37,17 @@ def parser() -> argparse.ArgumentParser:
 
     replay = commands.add_parser("replay", help="Автономный повтор raw.jsonl")
     replay.add_argument("--input", type=Path, required=True)
-    replay.add_argument("--tick-size", type=float, required=True)
-    replay.add_argument("--step-size", type=float, required=True)
-    replay.add_argument("--min-notional", type=float, default=5.0)
+    replay.add_argument("--tick-size", type=float)
+    replay.add_argument("--step-size", type=float)
+    replay.add_argument("--min-notional", type=float)
 
     commands.add_parser("demo", help="Синтетический полный цикл без сети")
     return result
 
 
 async def run(config: AppConfig, duration: float, confirm_live: bool) -> None:
-    if config.mode == "live" and not confirm_live:
-        raise ValueError("Для реальных ордеров добавьте --confirm-live")
+    if config.mode == "live" and not (config.allow_live and confirm_live):
+        raise ValueError("Для реальных ордеров нужны allow_live: true и --confirm-live")
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         venue = (
@@ -60,28 +62,36 @@ async def run(config: AppConfig, duration: float, confirm_live: bool) -> None:
         journal = Journal(
             config.data_dir, f"{config.exchange}-{config.symbol}-{config.mode}", record_raw=True
         )
+        journal.metadata(config, rules)
         robot = MarketMakingRobot(
             config,
             rules,
             journal,
             (
-                lambda on_fill, on_order: (
-                    PaperBroker(on_fill, on_order, config.strategy.paper_queue_ratio)
+                lambda on_fill, on_order, position: (
+                    PaperBroker(
+                        on_fill, on_order, config.strategy.paper_queue_ratio, lambda: position.quantity
+                    )
                     if config.mode == "paper"
                     else LiveBroker(venue, on_fill, on_order)
                 )
             ),
             initial_position,
         )
+        stopping = False
 
         async def feed() -> None:
             async for event in venue.events(config.symbol):
-                await robot.handle(event)
+                if stopping:
+                    return
+                await robot.handle(event, time.time_ns() // 1_000_000)
 
         async def watchdog() -> None:
             while True:
                 await asyncio.sleep(0.25)
-                await robot.tick(int(time.time() * 1000))
+                if stopping:
+                    return
+                await robot.tick(time.time_ns() // 1_000_000)
 
         feed_task = asyncio.create_task(feed())
         watchdog_task = asyncio.create_task(watchdog())
@@ -90,35 +100,48 @@ async def run(config: AppConfig, duration: float, confirm_live: bool) -> None:
             f"step={rules.step_size}, min={rules.min_notional}. Ctrl+C для остановки."
         )
         try:
-            await asyncio.wait({feed_task}, timeout=duration if duration > 0 else None)
-            if feed_task.done():
-                await feed_task
+            done, _ = await asyncio.wait(
+                {feed_task, watchdog_task},
+                timeout=duration if duration > 0 else None,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                await task
         finally:
-            feed_task.cancel()
-            watchdog_task.cancel()
-            await asyncio.gather(feed_task, watchdog_task, return_exceptions=True)
-            await robot.shutdown()
-            print(json.dumps(robot.summary(), ensure_ascii=False, indent=2))
-            print(f"События: {journal.events_path}")
-            print(f"Исходные данные: {journal.raw_path}")
-            journal.close()
+            stopping = True
+            try:
+                await robot.shutdown()
+                print(json.dumps(robot.summary(), ensure_ascii=False, indent=2))
+                print(f"События: {journal.events_path}")
+                print(f"Исходные данные: {journal.raw_path}")
+            finally:
+                feed_task.cancel()
+                watchdog_task.cancel()
+                await asyncio.gather(feed_task, watchdog_task, return_exceptions=True)
+                journal.close()
 
 
-async def replay(config: AppConfig, input_path: Path, rules: MarketRules) -> None:
+async def replay(config: AppConfig, input_path: Path, rules: MarketRules, *, legacy: bool) -> None:
     paper_config = config.model_copy(update={"mode": "paper", "allow_live": False})
     journal = Journal(config.data_dir, f"{config.exchange}-{config.symbol}-replay", record_raw=False)
     robot = MarketMakingRobot(
         paper_config,
         rules,
         journal,
-        lambda on_fill, on_order: PaperBroker(on_fill, on_order, config.strategy.paper_queue_ratio),
+        lambda on_fill, on_order, position: PaperBroker(
+            on_fill, on_order, config.strategy.paper_queue_ratio, lambda: position.quantity
+        ),
     )
-    events = read_raw(input_path)
+    last_timestamp: int | None = None
     try:
-        for event in events:
-            await robot.handle(event)
-        if events:
-            await robot.tick(events[-1].timestamp_ms)
+        for event, timestamp in read_raw(input_path):
+            last_timestamp = timestamp
+            if event is None:
+                await robot.tick(timestamp)
+            else:
+                await robot.handle(event, timestamp)
+        if legacy and last_timestamp is not None:
+            await robot.tick(last_timestamp)
     finally:
         await robot.shutdown()
         print(json.dumps(robot.summary(), ensure_ascii=False, indent=2))
@@ -148,11 +171,17 @@ async def demo(config: AppConfig) -> None:
         }
     )
     journal = Journal(config.data_dir, "demo", record_raw=True)
+    rules = MarketRules(
+        tick_size=0.01, step_size=0.001, min_notional=5.0, reduce_only_below_min_notional=True
+    )
+    journal.metadata(demo_config, rules)
     robot = MarketMakingRobot(
         demo_config,
-        MarketRules(tick_size=0.01, step_size=0.001, min_notional=5.0),
+        rules,
         journal,
-        lambda on_fill, on_order: PaperBroker(on_fill, on_order, config.strategy.paper_queue_ratio),
+        lambda on_fill, on_order, position: PaperBroker(
+            on_fill, on_order, demo_config.strategy.paper_queue_ratio, lambda: position.quantity
+        ),
     )
     try:
         for event in demo_events():
@@ -177,12 +206,43 @@ async def dispatch(args: argparse.Namespace) -> None:
             }.items()
             if value is not None
         }
-        await run(config.model_copy(update=updates), args.duration, args.confirm_live)
+        config = AppConfig.model_validate({**config.model_dump(), **updates})
+        await run(config, args.duration, args.confirm_live)
     elif args.command == "replay":
-        rules = MarketRules(args.tick_size, args.step_size, args.min_notional)
-        await replay(config, args.input, rules)
+        metadata = read_raw_metadata(args.input)
+        if metadata is not None:
+            recorded_config, recorded_rules = metadata
+            if args.config is None:
+                config = recorded_config.model_copy(update={"data_dir": config.data_dir})
+            elif (config.exchange, config.symbol) != (recorded_config.exchange, recorded_config.symbol):
+                raise ValueError("Биржа и инструмент конфигурации не совпадают с записью")
+        else:
+            if args.tick_size is None or args.step_size is None:
+                raise ValueError("Для старого raw.jsonl нужны --tick-size и --step-size")
+            recorded_rules = MarketRules(
+                0.0, 1.0, 5.0, reduce_only_below_min_notional=config.exchange == "aster"
+            )
+        rules = replace_market_rules(recorded_rules, args)
+        await replay(config, args.input, rules, legacy=metadata is None)
     else:
         await demo(config)
+
+
+def replace_market_rules(rules: MarketRules, args: argparse.Namespace) -> MarketRules:
+    changes = {
+        key: value
+        for key, value in {
+            "tick_size": args.tick_size,
+            "step_size": args.step_size,
+            "min_notional": args.min_notional,
+        }.items()
+        if value is not None
+    }
+    if any(not math.isfinite(value) or value < 0 for value in changes.values()):
+        raise ValueError("Параметры инструмента должны быть конечными и неотрицательными")
+    if changes.get("step_size") == 0:
+        raise ValueError("Шаг количества должен быть положительным")
+    return replace(rules, **changes)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
