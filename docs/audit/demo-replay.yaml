@@ -1,0 +1,11 @@
+exchange: aster
+symbol: DEMO
+mode: paper
+strategy:
+  baseline_buckets: 20
+  min_baseline_buckets: 10
+  signal_buckets: 5
+  volume_multiplier: 3.0
+  min_signal_quote: 1000
+  min_trades: 8
+  cooldown_sec: 0

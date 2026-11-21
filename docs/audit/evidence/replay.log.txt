@@ -1,0 +1,23 @@
+{
+  "exchange": "aster",
+  "symbol": "ASTERUSDT",
+  "mode": "paper",
+  "signals": 0,
+  "orders_placed": 0,
+  "orders_canceled": 0,
+  "fills": 0,
+  "rejected": 0,
+  "round_trips": 0,
+  "position_quantity": 0.0,
+  "position_notional_quote": 0.0,
+  "realized_pnl_quote": 0.0,
+  "unrealized_pnl_quote": 0.0,
+  "net_pnl_quote": 0.0,
+  "fees_quote": 0.0,
+  "halted": false,
+  "last_reason": "warmup",
+  "reason_counts": {
+    "warmup": 121
+  }
+}
+События: data\20261121-130534-aster-ASTERUSDT-replay.events.jsonl

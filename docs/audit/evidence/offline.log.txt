@@ -1,0 +1,16 @@
+Отмена 1: simulated cancel failure
+Размещение entry_buy: simulated accepted order with lost response
+Отмена 1: simulated cancel failure
+REPRODUCED cli_bypasses_second_gate: dispatcher forwards live, allow_live=False, confirm_live=True
+REPRODUCED replacement_after_cancel_error: two local open entries on one side: ['1', '2']
+REPRODUCED lost_order_ack: two unique requests sent to fake venue, only the second is tracked
+REPRODUCED open_snapshot_after_cancel: venue returned OPEN, local status is CANCELED and sync skipped it
+REPRODUCED stale_book_blocks_reconciliation: stale book and failed cancel skip account reconciliation
+REPRODUCED stop_with_small_remainder: halted with ~3 quote exposure and no reduce-only request
+REPRODUCED paper_reduce_only_reverses: simulated reduce-only IOC reverses +0.1 into -0.1
+REPRODUCED repeated_ioc_reuses_depth: two IOC fills totaling 0.2 against the same snapshot with 0.1 bid depth
+REPRODUCED late_trade_fills_existing_order: paper fill at 9900 ms against order created at 10000 ms
+REPRODUCED lot_grid_rounding: step 0.05 yields price=100.07, size=1.03, both off-grid
+REPRODUCED partial_close_drops_round_trip: flat after partial fills but round_trips=0
+REPRODUCED incomplete_baseline: 30 observed baseline seconds divided by 60, ratio=4 vs 2 over observed seconds
+12 cases reproduced
